@@ -9,7 +9,7 @@ This lab uses a single VM to host a complete Openstack install.
 
 This lab uses a 3 VMs to host an Openstack with 2 controllers and one compute node.
 
-## libvirt-based, 2 nodes 
+## libvirt-based and virtualbox-based, 2 nodes 
 
 This lab uses 2 VMs using libvirt as hypervisor to host an Openstack with 1 controllers and one compute node. 
 
