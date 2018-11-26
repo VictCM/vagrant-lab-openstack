@@ -9,7 +9,12 @@ This lab uses a single VM to host a complete Openstack install.
 
 This lab uses a 3 VMs to host an Openstack with 2 controllers and one compute node.
 
-## libvirt-based, 3 nodes 
+## libvirt-based, 2 nodes 
 
-This lab uses a 3 VMs using libvirt as hypervisor to host an Openstack with 2 controllers and one compute node. 
-Warning : due to to the use of macvlan based interfaces; the neutron external interface does not work yet. (FIXME)
+This lab uses 2 VMs using libvirt as hypervisor to host an Openstack with 1 controllers and one compute node. 
+
+Note: Due to high requirements this could not work properly if you do not meet the minimum req.:
+ - Controller node (named "Openstack"): 6GB memory
+ - Compute node (named "Compute01"): 1 GB
+ - Deploy: 500 MB
+ 
