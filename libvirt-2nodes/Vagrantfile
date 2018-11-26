@@ -1,0 +1,236 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# generate SSH key in the folder if they don't exist already
+system('echo "Installing vagrant plugins required and generate SSH key for Openstack cluster..."')
+system('[ -f ssh_key ] && echo "An existing key has been detected and will be used" || ssh-keygen -f ssh_key -P ""')
+system('[ $(vagrant plugin list | grep -c vagrant-libvirt) = "0" ] && vagrant plugin install vagrant-libvirt || echo "Vagrant-libvirt plugin detected"')
+system('[ $(vagrant plugin list | grep -c vagrant-reload) = "0" ] && vagrant plugin install vagrant-reload || echo "Vagrant-reload plugin detected"')
+
+
+Vagrant.configure("2") do |config|
+
+  $physical_interface = "enp0s25"
+
+  # common housekeeping for all the nodes (provisioning one and openstack nodes)
+  $common_provisioning = <<-SHELL
+# update packages list
+apt-get update
+
+# install pip to install a recent enough version of ansible
+apt-get -qy install python-pip
+apt-get -qy install python-dev libffi-dev gcc libssl-dev python-selinux python-setuptools
+pip install ansible 
+
+# declare static host part of the cluster
+echo "192.168.50.69 openstack" >> /etc/hosts
+echo "192.168.50.81 deploy" >> /etc/hosts
+echo "192.168.50.82 controller01" >> /etc/hosts
+echo "192.168.50.83 controller02" >> /etc/hosts
+echo "192.168.50.84 compute01" >> /etc/hosts
+
+# prepare ssh key injection (either key (deploy machine) or public one (cluster))
+mkdir -p /root/.ssh
+SHELL
+
+  # this section is responsible for configuring the VM nodes part of the cluster
+  $openstack_provisioning = <<-SHELL
+cat << 'EOF' | sudo tee /etc/network/interfaces.d/60-neutron.cfg
+auto eth2
+iface eth2 inet manual
+EOF
+ifup eth2
+adduser --disabled-password --gecos "" labuser
+echo labuser:labpassword | chpasswd
+adduser labuser sudo
+# deploy public ssh key so that the deploy node can run ansible
+cat /tmp/ssh_key.pub >> /root/.ssh/authorized_keys
+route del default
+route add default gw 192.168.50.253
+SHELL
+
+  # this section is responsible for configuring Openstack after the ansible scripts are run
+  $openstack_config = <<-SHELL
+# fix locales (in order to make openstack client happy)
+echo 'LC_ALL="en_US.UTF-8"'  >>  /etc/default/locale
+echo 'LC_CTYPE="en_US.UTF-8"'  >>  /etc/default/locale  
+# install openstack client and load variables with admin credentials
+pip install python-openstackclient
+source /etc/kolla/admin-openrc.sh
+# create public network
+openstack network create --external --provider-physical-network physnet1 --provider-network-type flat public1
+openstack subnet create --no-dhcp --allocation-pool start=192.168.50.150,end=192.168.50.170 --network public1 --subnet-range 192.168.50.0/24 --gateway 192.168.50.253 public1-subnet
+# adding flavor
+openstack flavor create --id 1 --ram 512 --disk 1 --vcpus 1 m1.tiny
+openstack flavor create --id 2 --ram 2048 --disk 20 --vcpus 1 m1.small
+openstack flavor create --id 3 --ram 4096 --disk 40 --vcpus 2 m1.medium
+openstack flavor create --id 4 --ram 8192 --disk 80 --vcpus 4 m1.large
+openstack flavor create --id 5 --ram 16384 --disk 160 --vcpus 8 m1.xlarge
+# create labsuser/labpassword user with admin level
+openstack project create --description 'Openstack Lab' lab --domain default
+openstack user create --project lab --password labpassword labuser
+openstack role add --user labuser --project lab admin
+SHELL
+
+  # this section is reponsible for installing Kolla on the deploy host and then trigger the deployment
+  $openstack_install = <<-SHELL
+# fixing hostname
+hostname deploy
+echo "deploy" > /etc/hostname
+
+# installing kolla from pip repo
+pip install kolla-ansible
+
+# getting default configuration for kolla
+cp -r /usr/local/share/kolla-ansible/etc_examples/kolla /etc/ 
+
+# altering configuration to match our configuration and choices in terms of distribution, network and virtualization engine (QEMU because Virtualbox does not do nested virtualization)
+# a) we are adding centralized logging, which will install a ELK instance listening on http://192.168.50.69:5601
+# b) we need to change keepalived virtual router id in order to elimiate conflict with concurrent openstack on the network
+sed -i s/'#openstack_release: ""'/'openstack_release: "rocky"'/g /etc/kolla/globals.yml
+sed -i s/'kolla_internal_vip_address: "10.10.10.254"'/'kolla_internal_vip_address: "192.168.50.69"'/g /etc/kolla/globals.yml
+sed -i s/'#network_interface: "eth0"'/'network_interface: "eth1"'/g /etc/kolla/globals.yml
+#sed -i s/'#enable_haproxy: "yes"'/'enable_haproxy: "yes"'/g /etc/kolla/globals.yml
+sed -i s/'#neutron_external_interface: "eth1"'/'neutron_external_interface: "eth2"'/g /etc/kolla/globals.yml
+sed -i s/'#enable_central_logging: "no"'/'enable_central_logging: "yes"'/g /etc/kolla/globals.yml
+sed -i s/'#keepalived_virtual_router_id: "51"'/'keepalived_virtual_router_id: "270"'/g /etc/kolla/globals.yml
+
+# Generating password and keeping a copy in this directory
+kolla-genpwd 
+
+# deploy SSH key generated previously (Vagrantfile)
+cat /tmp/ssh_key > /root/.ssh/id_rsa 
+cat /tmp/ssh_key.pub > /root/.ssh/id_rsa.pub
+chmod go-rwx /root/.ssh/id_rsa
+
+# fingerprinting ssh across all the hosts of the cluster
+ssh-keyscan controller01 >> /root/.ssh/known_hosts
+ssh-keyscan controller02 >> /root/.ssh/known_hosts
+ssh-keyscan compute01 >> /root/.ssh/known_hosts
+
+# Running Kolla 
+kolla-ansible -i /tmp/2-nodes bootstrap-servers
+kolla-ansible -i /tmp/2-nodes prechecks
+kolla-ansible -i /tmp/2-nodes deploy
+kolla-ansible -i /tmp/2-nodes post-deploy
+SHELL
+
+  # a controler 
+  config.vm.define "controller01" do |controller01|
+    
+    controller01.vm.box = "generic/ubuntu1604"
+    controller01.vm.provider :libvirt do |domain|
+      domain.memory = 2048 
+      domain.cpus = 2
+      domain.nested = true
+    end
+
+    controller01.vm.network "public_network", bridge: $physical_interface, :dev => $physical_interface, ip: "192.168.50.82" 
+    controller01.vm.network "public_network", bridge: $physical_interface, :dev => $physical_interface, auto_config: false
+
+    # deploying files to the VMs
+    controller01.vm.provision "file", source: "ssh_key.pub", destination: "/tmp/ssh_key.pub"
+
+    # housekeeping
+    controller01.vm.provision "shell", inline: $common_provisioning
+
+    # prepare for hosting openstack (mainly network interface + ssh)
+    controller01.vm.provision "shell", inline: $openstack_provisioning
+
+    # fix hostname (as RabbitMQ is using only hostname, this is necessary for the messaging between nodes to work)
+    controller01.vm.provision "shell", inline: <<-SHELL
+    hostname controller01
+    echo "controller01" > /etc/hostname
+    SHELL
+
+  end
+
+  # a 2nd controler 
+  config.vm.define "controller02" do |controller02|
+    
+    controller02.vm.box = "generic/ubuntu1604"
+    controller02.vm.provider :libvirt do |domain|
+      domain.memory = 2048 
+      domain.cpus = 2
+      domain.nested = true
+    end
+
+    controller02.vm.network "public_network", bridge: $physical_interface, :dev => $physical_interface, ip: "192.168.50.83" 
+    controller02.vm.network "public_network", bridge: $physical_interface, :dev => $physical_interface, auto_config: false
+
+    # deploying files to the VMs
+    controller02.vm.provision "file", source: "ssh_key.pub", destination: "/tmp/ssh_key.pub"
+
+    # housekeeping
+    controller02.vm.provision "shell", inline: $common_provisioning
+
+    # prepare for hosting openstack (mainly network interface + ssh)
+    controller02.vm.provision "shell", inline: $openstack_provisioning
+
+    # fix hostname (as RabbitMQ is using only hostname, this is necessary for the messaging between nodes to work)
+    controller02.vm.provision "shell", inline: <<-SHELL
+    hostname controller02
+    echo "controller02" > /etc/hostname
+    SHELL
+
+  end
+  
+
+  # a compute resource
+  config.vm.define "compute01" do |compute01|
+
+    compute01.vm.box = "generic/ubuntu1604"
+    compute01.vm.provider :libvirt do |domain|
+      domain.memory = 4096
+      domain.cpus = 3
+      domain.nested = true
+    end
+
+    compute01.vm.network "public_network", bridge: $physical_interface, :dev => $physical_interface, ip: "192.168.50.84" 
+    compute01.vm.network "public_network", bridge: $physical_interface, :dev => $physical_interface, auto_config: false
+
+    # deploying files to the VMs
+    compute01.vm.provision "file", source: "ssh_key.pub", destination: "/tmp/ssh_key.pub"
+
+    # housekeeping
+    compute01.vm.provision "shell", inline: $common_provisioning
+
+    # prepare for hosting openstack (mainly network interface + ssh)
+    compute01.vm.provision "shell", inline: $openstack_provisioning
+
+    # fix hostname (as RabbitMQ is using only hostname, this is necessary for the messaging between nodes to work)
+    compute01.vm.provision "shell", inline: <<-SHELL
+    hostname compute01
+    echo "compute01" > /etc/hostname
+    SHELL
+
+  end
+
+  # a provisioner machine that will execute Kolla and pilot the deployment of Openstack
+  config.vm.define "deploy" do |deploy|
+   
+   deploy.vm.box = "generic/ubuntu1604"
+    deploy.vm.provider :libvirt do |domain|
+      domain.memory = 512 
+      domain.cpus = 1 
+    end
+
+    
+    # physical interface
+    deploy.vm.network :public_network, :bridge => $physical_interface, :dev => $physical_interface, :ip => '192.168.50.81'
+
+    # deploying files to the VMs
+    deploy.vm.provision "file", source: "ssh_key", destination: "/tmp/ssh_key"
+    deploy.vm.provision "file", source: "ssh_key.pub", destination: "/tmp/ssh_key.pub"
+    deploy.vm.provision "file", source: "2-nodes", destination: "/tmp/2-nodes"
+
+    # housekeeping
+    deploy.vm.provision "shell", inline: $common_provisioning
+    
+    # install kolla and deploy openstack using ansible scripts provided by Kolla
+    deploy.vm.provision "shell", inline: $openstack_install
+
+    # configure newly install openstack with a labuser account
+    deploy.vm.provision "shell", inline: $openstack_config
+  end
+end
